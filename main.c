@@ -9,11 +9,15 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+//==============================================================================
+/* Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcja “.text” była pod adresem 0x1000, a sekcja “.data” tuż po niej; początki obu wyrównane do rozmiaru strony pamięci (0x1000).
+ * TODO Umieścić ‘relokacje’.
+ * TODO Przeliczyć zawartość “.text” względem ‘relokacji’ 0 zamiast 0x1000.
+ */
 //==============================================================================
 struct __attribute__ (( __packed__ )) Q_elf_Z_header
 { uint32_t magic;
@@ -150,7 +154,7 @@ main(
         return 1;
     if( write( dest_fd, &text_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &data_offset, sizeof( uint64_t )) != sizeof( uint64_t )
-    || write( dest_fd, &header->entry, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &header->entry - 0x1000, sizeof( uint64_t )) != sizeof( uint64_t )
     )
         return 1;
     return 0;
