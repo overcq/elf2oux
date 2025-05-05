@@ -14,10 +14,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 //==============================================================================
-/* Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcja “.text” była pod adresem 0x1000, a sekcja “.data” tuż po niej; początki obu wyrównane do rozmiaru strony pamięci (0x1000).
- * TODO Umieścić ‘relokacje’.
- * TODO Przeliczyć zawartość “.text” względem ‘relokacji’ 0 zamiast 0x1000.
- */
+//' Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcje były od adresu 0x1000, a adresy “.text” i “.data” – wyrównane do rozmiaru strony pamięci (0x1000).
 //==============================================================================
 struct __attribute__ (( __packed__ )) Q_elf_Z_header
 { uint32_t magic;
@@ -39,6 +36,29 @@ struct __attribute__ (( __packed__ )) Q_elf_Z_section_header_entry
   uint32_t link, info;
   uint64_t addralign, entsize;
 };
+struct __attribute__ (( __packed__ )) Q_elf_Z_rela_entry
+{ uint64_t offset;
+  uint32_t type, sym;
+  uint64_t addend;
+};
+struct __attribute__ (( __packed__ )) Q_exe_Z_rela_plt_entry
+{ uint64_t offset;
+  uint32_t sym;
+};
+struct __attribute__ (( __packed__ )) Q_elf_Z_dynsym_entry
+{ uint32_t sym; // Indeks w .dynstr (nazwa symbolu)
+  char info; // Typ i binding (np. funkcja/globalny)
+  char other; // Dodatkowe flagi (zwykle 0)
+  uint16_t shndx; // Indeks sekcji (lub SHN_UNDEF)
+  uint64_t value; // Wartość symbolu (adres/offset)
+  uint64_t size; // Rozmiar symbolu (np. rozmiar funkcji)
+};
+struct __attribute__ (( __packed__ )) Q_exe_Z_export_entry
+{ uint32_t sym;
+  uint64_t offset;
+};
+//==============================================================================
+const unsigned E_main_S_section_start = 0x1000;
 //==============================================================================
 size_t
 E_simple_Z_n_I_align_up_to_v2( size_t n
@@ -88,8 +108,8 @@ main(
     || header->class != 2
     || header->data != 1
     || header->machine != 0x3e
-    || header->phoff + header->phnum > stat.st_size
-    || header->shoff + header->shnum > stat.st_size
+    || header->phoff + header->phnum * sizeof( struct Q_elf_Z_program_header_entry ) > stat.st_size
+    || header->shoff + header->shnum * sizeof( struct Q_elf_Z_section_header_entry ) > stat.st_size
     || header->shstrndx >= header->shnum
     )
         return 1;
@@ -99,15 +119,118 @@ main(
     free( dest_name );
     if( write( dest_fd, "OUXEXE", 6 ) != 6 )
         return 1;
-    size_t offset = 6 + sizeof( uint64_t ) + sizeof( uint64_t ) + sizeof( uint64_t );
+    size_t offset = 6 + 6 * sizeof( uint64_t );
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;
+    // ‘Relokacje’ ze względu na adres, pod którym umieszczono program.
+    struct Q_elf_Z_rela_entry *rela = 0;
+    uint64_t rela_n = 0;
     struct Q_elf_Z_section_header_entry *section = ( void * )(( char * )src + header->shoff );
     struct Q_elf_Z_section_header_entry *shstr = &section[ header->shstrndx ];
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 4
+        && !strcmp(( char * )src + shstr->offset + section->name, ".rela.dyn" )
+        )
+        {   rela = ( void * )( ( char * )src + section->offset );
+            rela_n = section->size / sizeof( *rela );
+            for( uint64_t j = 0; j != rela_n; j++ )
+            {   switch( rela[j].type )
+                { case 6:
+                        if( rela[j].offset > stat.st_size - sizeof( uint64_t ))
+                            return 1;
+                        break;
+                  default:
+                        return 1;
+                }
+                rela[j].sym--;
+            }
+            break;
+        }
+        section++;
+    }
+    // ‘Relokacje’ procedur importowanych z ‘kernela’.
+    struct Q_elf_Z_rela_entry *rela_plt = 0;
+    uint64_t rela_plt_n = 0;
     section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 4
+        && !strcmp(( char * )src + shstr->offset + section->name, ".rela.plt" )
+        )
+        {   rela_plt = ( void * )(( char * )src + section->offset );
+            rela_plt_n = section->size / sizeof( *rela_plt );
+            for( uint64_t j = 0; j != rela_plt_n; j++ )
+            {   if( rela_plt[j].type != 7 )
+                    return 1;
+                rela_plt[j].sym--;
+            }
+            break;
+        }
+        section++;
+    }
+    // Symbole eksportowane.
+    struct Q_elf_Z_dynsym_entry *dynsym = 0;
+    uint64_t dynsym_n = 0;
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 11
+        && !strcmp(( char * )src + shstr->offset + section->name, ".dynsym" )
+        )
+        {   dynsym = ( void * )(( char * )src + section->offset );
+            dynsym_n = section->size / sizeof( *dynsym );
+            break;
+        }
+        section++;
+    }
+    struct Q_exe_Z_export_entry *my_exports = 0;
+    uint64_t my_exports_n = 0;
+    for( uint64_t i = 0; i != dynsym_n; i++ )
+    {   if( dynsym[i].shndx )
+        {   my_exports = realloc( my_exports, ( my_exports_n + 1 ) * sizeof( *my_exports ));
+            if( !my_exports )
+                return 1;
+            my_exports[ my_exports_n ].sym = dynsym[i].sym - 1;
+            my_exports[ my_exports_n ].offset = dynsym[i].value;
+            my_exports_n++;
+        }
+    }
+    if(rela)
+        if( write( dest_fd, rela, rela_n * sizeof( *rela )) != rela_n * sizeof( *rela ))
+            return 1;
+    uint64_t rela_plt_offset = offset += rela_n * sizeof( *rela );
+    if( rela_plt )
+        for( uint64_t i = 0; i != rela_plt_n; i++ )
+        {   struct Q_exe_Z_rela_plt_entry my_rela_plt;
+            my_rela_plt.offset = rela_plt[i].offset;
+            my_rela_plt.sym = rela_plt[i].sym;
+            if( write( dest_fd, &my_rela_plt, sizeof( my_rela_plt )) != sizeof( my_rela_plt ))
+                return 1;
+        }
+    uint64_t exports_offset = offset += rela_plt_n * sizeof( rela_plt );
+    for( uint64_t i = 0; i != my_exports_n; i++ )
+        if( write( dest_fd, &my_exports[i], sizeof( *my_exports )) != sizeof( *my_exports ))
+            return 1;
+    free( my_exports );
+    char *dynstr = 0;
+    uint64_t dynstr_offset = offset += my_exports_n * sizeof( *my_exports );
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 3
+        && !strcmp(( char * )src + shstr->offset + section->name, ".dynstr" )
+        )
+        {   dynstr = src + section->offset + 1;
+            if( *( dynstr - 1 )
+            || write( dest_fd, dynstr, section->size - 1 ) != section->size - 1
+            )
+                return 1;
+            offset += section->size - 1;
+            break;
+        }
+        section++;
+    }
+    // Główny kod programu.
     uint64_t text_offset = 0;
-    unsigned i;
-    for( i = 0; i != header->shnum; i++ )
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".text" )
         )
@@ -121,16 +244,15 @@ main(
                 return 1;
             text_offset = offset;
             offset += section->size;
-            section++;
-            i++;
             break;
         }
         section++;
     }
     if( !text_offset )
-        return 0;
-    uint64_t data_offset = 0;
-    for( ; i != header->shnum; i++ )
+        return 1;
+    // Główne dane programu.
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".data" )
         )
@@ -142,19 +264,20 @@ main(
             }
             if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
                 return 1;
-            data_offset = offset;
             break;
         }
         section++;
     }
-    if( !data_offset )
-        return 0;
+    uint64_t data_offset = offset;
     offset = 6;
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;
-    if( write( dest_fd, &text_offset, sizeof( uint64_t )) != sizeof( uint64_t )
+    if( write( dest_fd, &rela_plt_offset, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &exports_offset, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &dynstr_offset, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &text_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &data_offset, sizeof( uint64_t )) != sizeof( uint64_t )
-    || write( dest_fd, &header->entry - 0x1000, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &header->entry, sizeof( uint64_t )) != sizeof( uint64_t )
     )
         return 1;
     return 0;
