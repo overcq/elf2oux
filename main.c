@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 //==============================================================================
-//' Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcje były od adresu 0x1000, a adresy “.text” i “.data” – wyrównane do rozmiaru strony pamięci (0x1000).
+//' Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcje “.got”, “.got.plt”, “.text” i “.data” były kolejno, adresy “.got”, “.text” i “.data” – wyrównane do rozmiaru strony pamięci (0x1000), a “.got.plt” – do 24, jeśli rozmiar “.got” jest co najmniej 24.
 //==============================================================================
 struct __attribute__ (( __packed__ )) Q_elf_Z_header
 { uint32_t magic;
@@ -57,8 +57,6 @@ struct __attribute__ (( __packed__ )) Q_exe_Z_export_entry
 { uint32_t sym;
   uint64_t offset;
 };
-//==============================================================================
-const unsigned E_main_S_section_start = 0x1000;
 //==============================================================================
 size_t
 E_simple_Z_n_I_align_up_to_v2( size_t n
@@ -119,14 +117,27 @@ main(
     free( dest_name );
     if( write( dest_fd, "OUXEXE", 6 ) != 6 )
         return 1;
-    size_t offset = 6 + 6 * sizeof( uint64_t );
+    size_t offset = 6 + 7 * sizeof( uint64_t );
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
+        return 1;
+    uint64_t vma_delta = 0;
+    struct Q_elf_Z_section_header_entry *section = ( void * )(( char * )src + header->shoff );
+    struct Q_elf_Z_section_header_entry *shstr = &section[ header->shstrndx ];
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 1
+        && !strcmp(( char * )src + shstr->offset + section->name, ".text" )
+        )
+        {   vma_delta = section->addr - section->offset;
+            break;
+        }
+        section++;
+    }
+    if( !vma_delta )
         return 1;
     // ‘Relokacje’ ze względu na adres, pod którym umieszczono program.
     struct Q_elf_Z_rela_entry *rela = 0;
     uint64_t rela_n = 0;
-    struct Q_elf_Z_section_header_entry *section = ( void * )(( char * )src + header->shoff );
-    struct Q_elf_Z_section_header_entry *shstr = &section[ header->shstrndx ];
+    section = ( void * )(( char * )src + header->shoff );
     for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 4
         && !strcmp(( char * )src + shstr->offset + section->name, ".rela.dyn" )
@@ -138,6 +149,7 @@ main(
                 { case 6:
                         if( rela[j].offset > stat.st_size - sizeof( uint64_t ))
                             return 1;
+                        rela[j].offset -= vma_delta;
                         break;
                   default:
                         return 1;
@@ -161,6 +173,7 @@ main(
             for( uint64_t j = 0; j != rela_plt_n; j++ )
             {   if( rela_plt[j].type != 7 )
                     return 1;
+                rela_plt[j].offset -= vma_delta;
                 rela_plt[j].sym--;
             }
             break;
@@ -189,7 +202,7 @@ main(
             if( !my_exports )
                 return 1;
             my_exports[ my_exports_n ].sym = dynsym[i].sym - 1;
-            my_exports[ my_exports_n ].offset = dynsym[i].value;
+            my_exports[ my_exports_n ].offset = dynsym[i].value - vma_delta;
             my_exports_n++;
         }
     }
@@ -227,8 +240,72 @@ main(
         }
         section++;
     }
+    uint64_t got_offset = 0;
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 1
+        && !strcmp(( char * )src + shstr->offset + section->name, ".got" )
+        )
+        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+            if( aligned != offset )
+            {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
+                    return 1;
+                offset = aligned;
+            }
+            if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
+                return 1;
+            uint64_t got_size = section->size;
+            got_offset = offset;
+            offset += section->size;
+            section = ( void * )(( char * )src + header->shoff );
+            for( unsigned i = 0; i != header->shnum; i++ )
+            {   if( section->type == 1
+                && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
+                )
+                {   if( got_size >= 24 )
+                    {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 24 );
+                        if( aligned != offset )
+                        {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
+                                return 1;
+                            offset = aligned;
+                        }
+                    }
+                    if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
+                        return 1;
+                    offset += section->size;
+                    break;
+                }
+                section++;
+            }
+            break;
+        }
+        section++;
+    }
+    if( !got_offset )
+    {   section = ( void * )(( char * )src + header->shoff );
+        for( unsigned i = 0; i != header->shnum; i++ )
+        {   if( section->type == 1
+            && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
+            )
+            {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+                if( aligned != offset )
+                {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
+                        return 1;
+                    offset = aligned;
+                }
+                if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
+                    return 1;
+                got_offset = offset;
+                offset += section->size;
+                break;
+            }
+            section++;
+        }
+    }
+    if( !got_offset )
+        got_offset = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
     // Główny kod programu.
-    uint64_t text_offset = 0;
+    uint64_t text_offset;
     section = ( void * )(( char * )src + header->shoff );
     for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 1
@@ -248,9 +325,8 @@ main(
         }
         section++;
     }
-    if( !text_offset )
-        return 1;
     // Główne dane programu.
+    uint64_t data_offset = 0;
     section = ( void * )(( char * )src + header->shoff );
     for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 1
@@ -264,17 +340,21 @@ main(
             }
             if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
                 return 1;
+            data_offset = offset;
             break;
         }
         section++;
     }
-    uint64_t data_offset = offset;
+    if( !data_offset )
+        data_offset = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
     offset = 6;
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;
+    header->entry -= vma_delta;
     if( write( dest_fd, &rela_plt_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &exports_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &dynstr_offset, sizeof( uint64_t )) != sizeof( uint64_t )
+    || write( dest_fd, &got_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &text_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &data_offset, sizeof( uint64_t )) != sizeof( uint64_t )
     || write( dest_fd, &header->entry, sizeof( uint64_t )) != sizeof( uint64_t )
