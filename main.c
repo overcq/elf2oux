@@ -120,6 +120,7 @@ main(
     size_t offset = 6 + 7 * sizeof( uint64_t );
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;
+    bool has_text = false;
     uint64_t vma_delta = 0;
     struct Q_elf_Z_section_header_entry *section = ( void * )(( char * )src + header->shoff );
     struct Q_elf_Z_section_header_entry *shstr = &section[ header->shstrndx ];
@@ -127,12 +128,13 @@ main(
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".text" )
         )
-        {   vma_delta = section->addr - section->offset;
+        {   has_text = true;
+            vma_delta = section->addr;
             break;
         }
         section++;
     }
-    if( !vma_delta )
+    if( !has_text )
         return 1;
     // ‘Relokacje’ ze względu na adres, pod którym umieszczono program.
     struct Q_elf_Z_rela_entry *rela = 0;
@@ -149,7 +151,6 @@ main(
                 { case 6:
                         if( rela[j].offset > stat.st_size - sizeof( uint64_t ))
                             return 1;
-                        rela[j].offset -= vma_delta;
                         break;
                   default:
                         return 1;
@@ -173,7 +174,6 @@ main(
             for( uint64_t j = 0; j != rela_plt_n; j++ )
             {   if( rela_plt[j].type != 7 )
                     return 1;
-                rela_plt[j].offset -= vma_delta;
                 rela_plt[j].sym--;
             }
             break;
@@ -202,26 +202,77 @@ main(
             if( !my_exports )
                 return 1;
             my_exports[ my_exports_n ].sym = dynsym[i].sym - 1;
-            my_exports[ my_exports_n ].offset = dynsym[i].value - vma_delta;
+            my_exports[ my_exports_n ].offset = dynsym[i].value;
             my_exports_n++;
         }
     }
+    uint64_t dynstr_size = 0;
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 3
+        && !strcmp(( char * )src + shstr->offset + section->name, ".dynstr" )
+        )
+        {   dynstr_size = section->size - 1;
+            break;
+        }
+        section++;
+    }
+    uint64_t got_size = 0;
+    section = ( void * )(( char * )src + header->shoff );
+    for( unsigned i = 0; i != header->shnum; i++ )
+    {   if( section->type == 1
+        && !strcmp(( char * )src + shstr->offset + section->name, ".got" )
+        )
+        {   got_size = section->size;
+            section = ( void * )(( char * )src + header->shoff );
+            for( unsigned i = 0; i != header->shnum; i++ )
+            {   if( section->type == 1
+                && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
+                )
+                {   got_size += section->size;
+                    break;
+                }
+                section++;
+            }
+            break;
+        }
+        section++;
+    }
+    if( !got_size )
+    {   section = ( void * )(( char * )src + header->shoff );
+        for( unsigned i = 0; i != header->shnum; i++ )
+        {   if( section->type == 1
+            && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
+            )
+            {   got_size = section->size;
+                break;
+            }
+            section++;
+        }
+    }
+    uint64_t text_offset = E_simple_Z_n_I_align_up_to_v2( E_simple_Z_n_I_align_up_to_v2( offset + rela_n * sizeof( *rela ) + rela_plt_n * sizeof( rela_plt ) + my_exports_n * sizeof( *my_exports ) + dynstr_size, 0x1000 ) + got_size, 0x1000 );
+    vma_delta -= text_offset;
     if(rela)
+    {   for( uint64_t j = 0; j != rela_n; j++ )
+            rela[j].offset -= vma_delta;
         if( write( dest_fd, rela, rela_n * sizeof( *rela )) != rela_n * sizeof( *rela ))
             return 1;
+    }
     uint64_t rela_plt_offset = offset += rela_n * sizeof( *rela );
     if( rela_plt )
         for( uint64_t i = 0; i != rela_plt_n; i++ )
         {   struct Q_exe_Z_rela_plt_entry my_rela_plt;
-            my_rela_plt.offset = rela_plt[i].offset;
+            my_rela_plt.offset = rela_plt[i].offset - vma_delta;
             my_rela_plt.sym = rela_plt[i].sym;
             if( write( dest_fd, &my_rela_plt, sizeof( my_rela_plt )) != sizeof( my_rela_plt ))
                 return 1;
         }
     uint64_t exports_offset = offset += rela_plt_n * sizeof( rela_plt );
     for( uint64_t i = 0; i != my_exports_n; i++ )
+    {   my_exports[i].offset -= vma_delta;
         if( write( dest_fd, &my_exports[i], sizeof( *my_exports )) != sizeof( *my_exports ))
             return 1;
+    }
     free( my_exports );
     char *dynstr = 0;
     uint64_t dynstr_offset = offset += my_exports_n * sizeof( *my_exports );
@@ -246,7 +297,7 @@ main(
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".got" )
         )
-        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
             if( aligned != offset )
             {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
                     return 1;
@@ -254,7 +305,6 @@ main(
             }
             if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
                 return 1;
-            uint64_t got_size = section->size;
             got_offset = offset;
             offset += section->size;
             section = ( void * )(( char * )src + header->shoff );
@@ -262,15 +312,7 @@ main(
             {   if( section->type == 1
                 && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
                 )
-                {   if( got_size >= 24 )
-                    {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 24 );
-                        if( aligned != offset )
-                        {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
-                                return 1;
-                            offset = aligned;
-                        }
-                    }
-                    if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
+                {   if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
                         return 1;
                     offset += section->size;
                     break;
@@ -287,7 +329,7 @@ main(
         {   if( section->type == 1
             && !strcmp(( char * )src + shstr->offset + section->name, ".got.plt" )
             )
-            {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+            {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
                 if( aligned != offset )
                 {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
                         return 1;
@@ -303,15 +345,14 @@ main(
         }
     }
     if( !got_offset )
-        got_offset = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+        got_offset = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
     // Główny kod programu.
-    uint64_t text_offset;
     section = ( void * )(( char * )src + header->shoff );
     for( unsigned i = 0; i != header->shnum; i++ )
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".text" )
         )
-        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
             if( aligned != offset )
             {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
                     return 1;
@@ -319,7 +360,6 @@ main(
             }
             if( write( dest_fd, ( char * )src + section->offset, section->size ) != section->size )
                 return 1;
-            text_offset = offset;
             offset += section->size;
             break;
         }
@@ -332,7 +372,7 @@ main(
     {   if( section->type == 1
         && !strcmp(( char * )src + shstr->offset + section->name, ".data" )
         )
-        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+        {   off_t aligned = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
             if( aligned != offset )
             {   if( lseek( dest_fd, aligned, SEEK_SET ) != aligned )
                     return 1;
@@ -346,7 +386,7 @@ main(
         section++;
     }
     if( !data_offset )
-        data_offset = E_simple_Z_n_I_align_up_to_v2( offset, 4096 );
+        data_offset = E_simple_Z_n_I_align_up_to_v2( offset, 0x1000 );
     offset = 6;
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;

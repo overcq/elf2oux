@@ -15,7 +15,7 @@ build: elf2oux
 .PHONY: all build clean install uninstall
 #===============================================================================
 elf2oux: main.c Makefile
-	$(CC) $(CFLAGS) -fwrapv -Wall -Wextra -s -o $@ $(filter %.c,$^)
+	$(CC) $(CFLAGS) -std=gnu23 -fwrapv -Wall -Wextra -s -o $@ $(filter %.c,$^)
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 clean:
 	rm -f elf2oux
