@@ -14,8 +14,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 //==============================================================================
-//' Plik ELF ‘kernela’ potrzebuje być zbudowany z dostosowanym skryptem ‘linkera’, tak by sekcje “.got”, “.got.plt”, “.text” i “.data” były kolejno, adresy “.got”, “.text” i “.data” – wyrównane do rozmiaru strony pamięci (0x1000), a “.got.plt” – do 24, jeśli rozmiar “.got” jest co najmniej 24.
-//==============================================================================
 struct __attribute__ (( __packed__ )) Q_elf_Z_header
 { uint32_t magic;
   char class, data, version_1, os_abi, abi_version;
@@ -121,7 +119,7 @@ main(
     if( lseek( dest_fd, offset, SEEK_SET ) != offset )
         return 1;
     bool has_text = false;
-    uint64_t vma_delta = 0;
+    uint64_t vma_delta;
     struct Q_elf_Z_section_header_entry *section = ( void * )(( char * )src + header->shoff );
     struct Q_elf_Z_section_header_entry *shstr = &section[ header->shstrndx ];
     for( unsigned i = 0; i != header->shnum; i++ )
