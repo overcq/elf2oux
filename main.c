@@ -147,6 +147,7 @@ main(
             for( uint64_t j = 0; j != rela_n; j++ )
             {   switch( rela[j].type )
                 { case 6:
+                  case 8:
                         if( rela[j].offset > stat.st_size - sizeof( uint64_t ))
                             return 1;
                         break;
