@@ -253,7 +253,10 @@ main(
     vma_delta -= text_offset;
     if(rela)
     {   for( uint64_t j = 0; j != rela_n; j++ )
-            rela[j].offset -= vma_delta;
+        {   rela[j].offset -= vma_delta;
+            if( rela[j].type == 8 )
+                rela[j].addend -= vma_delta;
+        }
         if( write( dest_fd, rela, rela_n * sizeof( *rela )) != rela_n * sizeof( *rela ))
             return 1;
     }
